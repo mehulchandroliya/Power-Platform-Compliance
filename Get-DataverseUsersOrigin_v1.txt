@@ -1,0 +1,939 @@
+﻿<#
+.SYNOPSIS
+Lists Dataverse security roles and categorises each role as Microsoft, Custom, or Managed non-Microsoft.
+
+.DESCRIPTION
+The script calls the Dataverse Web API and uses role metadata to infer origin:
+- roletemplateid: links roles created from Microsoft role templates.
+- ismanaged: tells whether the role is part of a managed solution.
+- solution publisher: distinguishes Microsoft managed content from ISV/customer managed content.
+- product solution/name patterns: identifies common predefined Dynamics 365 product roles and reports ProductName.
+- product role purpose patterns: labels common Dynamics 365 product roles as Functional, App Access, Internal, or Administrative.
+- role documentation lookup: adds a short Microsoft-documented description, AccessGranted text, and source link for known predefined roles.
+
+Because copied or solution-imported roles can be ambiguous, the script also emits an Evidence column.
+
+.PARAMETER EnvironmentUrl
+Dataverse environment URL, for example https://contoso.crm.dynamics.com.
+
+.PARAMETER AccessToken
+Optional OAuth bearer token for the Dataverse environment. If omitted, the script uses Az.Accounts
+and prompts through Connect-AzAccount when needed.
+
+.PARAMETER OutputPath
+Optional CSV output path. Defaults to .\DataverseSecurityRoles-Origin.csv.
+
+.PARAMETER IncludeBusinessUnitCopies
+By default, the script returns one row per root role. Use this switch to list every business-unit copy.
+
+.EXAMPLE
+.\Get-DataverseSecurityRoleOrigin.ps1 -EnvironmentUrl "https://contoso.crm.dynamics.com"
+
+.EXAMPLE
+$token = (Get-AzAccessToken -ResourceUrl "https://contoso.crm.dynamics.com").Token
+.\Get-DataverseSecurityRoleOrigin.ps1 -EnvironmentUrl "https://contoso.crm.dynamics.com" -AccessToken $token
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('^https://')]
+    [string]$EnvironmentUrl,
+
+    [Parameter(Mandatory = $false)]
+    [string]$AccessToken,
+
+    [Parameter(Mandatory = $false)]
+    [string]$OutputPath = ".\DataverseSecurityRoles-Origin.csv",
+
+    [Parameter(Mandatory = $false)]
+    [switch]$IncludeBusinessUnitCopies
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+$script:KnownProductRoleNames = $null
+$script:KnownRoleDocumentation = $null
+
+function Normalize-EnvironmentUrl {
+    param([string]$Url)
+    return $Url.TrimEnd("/")
+}
+
+function Get-DataverseAccessToken {
+    param([string]$ResourceUrl)
+
+    if ($AccessToken) {
+        return $AccessToken
+    }
+
+    if (-not (Get-Module -ListAvailable -Name Az.Accounts)) {
+        throw "Az.Accounts is required when -AccessToken is not supplied. Install it with: Install-Module Az.Accounts -Scope CurrentUser"
+    }
+
+    Import-Module Az.Accounts -ErrorAction Stop
+
+    try {
+        $context = Get-AzContext -ErrorAction Stop
+    }
+    catch {
+        $context = $null
+    }
+
+    if (-not $context) {
+        Connect-AzAccount | Out-Null
+    }
+
+    $tokenResponse = Get-AzAccessToken -ResourceUrl $ResourceUrl
+    if ($tokenResponse.Token -is [System.Security.SecureString]) {
+        $credential = [System.Net.NetworkCredential]::new("", $tokenResponse.Token)
+        return $credential.Password
+    }
+
+    return [string]$tokenResponse.Token
+}
+
+function Invoke-DataversePagedGet {
+    param(
+        [string]$Url,
+        [hashtable]$Headers
+    )
+
+    $items = New-Object System.Collections.Generic.List[object]
+    $nextUrl = $Url
+
+    while ($nextUrl) {
+        $response = Invoke-RestMethod -Method Get -Uri $nextUrl -Headers $Headers
+        foreach ($item in $response.value) {
+            $items.Add($item)
+        }
+
+        $nextProperty = "@odata.nextLink"
+        if ($response.PSObject.Properties.Name -contains $nextProperty) {
+            $nextUrl = $response.$nextProperty
+        }
+        else {
+            $nextUrl = $null
+        }
+    }
+
+    return $items
+}
+
+function Get-PropertyValue {
+    param(
+        [object]$Object,
+        [string]$Name
+    )
+
+    if ($null -eq $Object) {
+        return $null
+    }
+
+    $property = $Object.PSObject.Properties[$Name]
+    if ($property) {
+        return $property.Value
+    }
+
+    return $null
+}
+
+function Get-FormattedValue {
+    param(
+        [object]$Object,
+        [string]$LookupName
+    )
+
+    return Get-PropertyValue -Object $Object -Name "$LookupName@OData.Community.Display.V1.FormattedValue"
+}
+
+function Test-MicrosoftPublisher {
+    param(
+        [string]$PublisherName,
+        [string]$PublisherUniqueName,
+        [string]$CustomizationPrefix
+    )
+
+    $values = @($PublisherName, $PublisherUniqueName, $CustomizationPrefix) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    foreach ($value in $values) {
+        if ($value -match '^(Microsoft|Microsoft Corporation|MicrosoftCorporation|Microsoft First Party)$') {
+            return $true
+        }
+        if ($value -match '^msdyn' -or $value -match '^msfp' -or $value -eq "microsoft") {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Test-KnownPredefinedRole {
+    param([string]$RoleName)
+
+    $knownPredefinedRoleNames = @(
+        "App Opener",
+        "Basic User",
+        "Delegate",
+        "Dynamics 365 Administrator",
+        "Environment Maker",
+        "Global Administrator",
+        "Global Reader",
+        "Office Collaborator",
+        "Power Platform administrator",
+        "Service Deleted",
+        "Service Reader",
+        "Service Writer",
+        "Support User",
+        "System Administrator",
+        "System Customizer",
+        "Website App Owner",
+        "Website Owner"
+    )
+
+    return $knownPredefinedRoleNames -contains $RoleName
+}
+
+function Get-MicrosoftProductName {
+    param(
+        [string]$RoleName,
+        [bool]$IsKnownPredefinedRole,
+        [string]$SolutionName,
+        [string]$SolutionUniqueName,
+        [string]$PublisherPrefix
+    )
+
+    if ($IsKnownPredefinedRole) {
+        return "Dataverse"
+    }
+
+    $solutionText = "$SolutionUniqueName $SolutionName".ToLowerInvariant()
+    $publisherPrefixText = if ($PublisherPrefix) { $PublisherPrefix.ToLowerInvariant() } else { "" }
+
+    $solutionProductPatterns = @(
+        @{ Pattern = 'sales|msdynce_sales|salesenterprise|salesprofessional'; ProductName = "Dynamics 365 Sales" },
+        @{ Pattern = 'customer.?service|customerservice|msdynce_service|omnichannel|omnichannelengagementhub|unifiedrouting|knowledge'; ProductName = "Dynamics 365 Customer Service" },
+        @{ Pattern = 'field.?service|fieldservice|msdynce_fieldservice|msdyn_fieldservice'; ProductName = "Dynamics 365 Field Service" },
+        @{ Pattern = 'project.?operations|projectservice|project.?service.?automation|msdyn_project|msdynce_project'; ProductName = "Dynamics 365 Project Operations" },
+        @{ Pattern = 'marketing|customer.?insights.?journeys|realtime.?marketing|eventmanagement|msdyncrm'; ProductName = "Dynamics 365 Customer Insights - Journeys" },
+        @{ Pattern = 'customer.?insights|customerinsights|msdynci'; ProductName = "Dynamics 365 Customer Insights - Data" },
+        @{ Pattern = 'commerce|retail|msdyn_commerce'; ProductName = "Dynamics 365 Commerce" },
+        @{ Pattern = 'fraud.?protection|fraudprotection'; ProductName = "Dynamics 365 Fraud Protection" },
+        @{ Pattern = 'guides|remote.?assist|mixed.?reality'; ProductName = "Dynamics 365 Mixed Reality" }
+    )
+
+    foreach ($productPattern in $solutionProductPatterns) {
+        if ($solutionText -match $productPattern.Pattern) {
+            return $productPattern.ProductName
+        }
+    }
+
+    if ($publisherPrefixText -eq "msdyn" -and $solutionText -match 'sales') {
+        return "Dynamics 365 Sales"
+    }
+
+    if (-not $script:KnownProductRoleNames) {
+        $script:KnownProductRoleNames = @{
+            "Salesperson"                              = "Dynamics 365 Sales"
+            "Sales Manager"                           = "Dynamics 365 Sales"
+            "Sales Professional Manager"              = "Dynamics 365 Sales"
+            "Sales Professional Person"               = "Dynamics 365 Sales"
+            "Forecast Manager"                        = "Dynamics 365 Sales"
+            "Forecast User"                           = "Dynamics 365 Sales"
+            "Forecast Appuser"                        = "Dynamics 365 Sales"
+            "Sequence Manager"                        = "Dynamics 365 Sales"
+            "Sales team member"                       = "Dynamics 365 Sales"
+            "Sales Enterprise App Access"             = "Dynamics 365 Sales"
+            "Sales Professional App Access"           = "Dynamics 365 Sales"
+            "Sales, Enterprise app access"            = "Dynamics 365 Sales"
+            "Vice President of Sales"                 = "Dynamics 365 Sales"
+            "VP of Sales"                             = "Dynamics 365 Sales"
+            "Customer Service Representative"         = "Dynamics 365 Customer Service"
+            "CSR Manager"                             = "Dynamics 365 Customer Service"
+            "Customer Service Manager"                = "Dynamics 365 Customer Service"
+            "Customer Service App Access"             = "Dynamics 365 Customer Service"
+            "App Profile User"                        = "Dynamics 365 Customer Service"
+            "Knowledge Manager"                       = "Dynamics 365 Customer Service"
+            "Knowledge Author"                        = "Dynamics 365 Customer Service"
+            "Knowledge Search app user"               = "Dynamics 365 Customer Service"
+            "Omnichannel Agent"                       = "Dynamics 365 Customer Service"
+            "Omnichannel Supervisor"                  = "Dynamics 365 Customer Service"
+            "Omnichannel Administrator"               = "Dynamics 365 Customer Service"
+            "Productivity tools user"                 = "Dynamics 365 Customer Service"
+            "Field Service - Administrator"           = "Dynamics 365 Field Service"
+            "Field Service - Dispatcher"              = "Dynamics 365 Field Service"
+            "Field Service - Resource"                = "Dynamics 365 Field Service"
+            "Field Service - Inventory Purchase"      = "Dynamics 365 Field Service"
+            "Field Service App Access"                = "Dynamics 365 Field Service"
+            "Field Service - App Access"              = "Dynamics 365 Field Service"
+            "IoT - Administrator"                     = "Dynamics 365 Field Service"
+            "IoT - Endpoint User"                     = "Dynamics 365 Field Service"
+            "CFS - IoT Alert Process Flow"            = "Dynamics 365 Field Service"
+            "Project Manager"                         = "Dynamics 365 Project Operations"
+            "Project Resource"                        = "Dynamics 365 Project Operations"
+            "Project Team Member"                     = "Dynamics 365 Project Operations"
+            "Project Approver"                        = "Dynamics 365 Project Operations"
+            "Practice Manager"                        = "Dynamics 365 Project Operations"
+            "Project Operations App Access"           = "Dynamics 365 Project Operations"
+            "Project Operations - App Access"         = "Dynamics 365 Project Operations"
+            "Marketing Professional - Business"       = "Dynamics 365 Customer Insights - Journeys"
+            "Marketing Manager - Business"            = "Dynamics 365 Customer Insights - Journeys"
+            "Marketing, Business App Access"          = "Dynamics 365 Customer Insights - Journeys"
+            "Dynamics 365 Marketing Application User" = "Dynamics 365 Customer Insights - Journeys"
+            "EventManagement S2S Inbound"             = "Dynamics 365 Customer Insights - Journeys"
+            "Marketing Services User"                 = "Dynamics 365 Customer Insights - Journeys"
+            "Marketing Services Application User"     = "Dynamics 365 Customer Insights - Journeys"
+        }
+    }
+
+    if ($script:KnownProductRoleNames.ContainsKey($RoleName)) {
+        return $script:KnownProductRoleNames[$RoleName]
+    }
+
+    return $null
+}
+
+function Get-ProductRolePurpose {
+    param(
+        [string]$RoleName,
+        [string]$ProductName,
+        [bool]$IsKnownPredefinedRole
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ProductName)) {
+        return $null
+    }
+
+    if ($IsKnownPredefinedRole) {
+        if ($RoleName -match '(?i)administrator|admin|customizer|maker|owner') {
+            return "Administrative"
+        }
+
+        return "Functional"
+    }
+
+    $internalRoleNames = @(
+        "Forecast Appuser",
+        "Dynamics 365 Marketing Application User",
+        "EventManagement S2S Inbound",
+        "Marketing, Business App Access",
+        "Marketing Services User",
+        "Marketing Services Application User",
+        "IoT - Endpoint User",
+        "CFS - IoT Alert Process Flow"
+    )
+
+    if ($internalRoleNames -contains $RoleName) {
+        return "Internal"
+    }
+
+    if ($RoleName -match '(?i)app access|appaccess|app profile user|sales team member|knowledge search app user') {
+        return "App Access"
+    }
+
+    if ($RoleName -match '(?i)administrator|admin|customizer|owner') {
+        return "Administrative"
+    }
+
+    return "Functional"
+}
+
+function Get-KnownRoleDocumentation {
+    param(
+        [string]$RoleName,
+        [string]$ProductName,
+        [string]$ProductRolePurpose,
+        [bool]$IsKnownPredefinedRole,
+        [string]$ExistingRoleDescription
+    )
+
+    if (-not $script:KnownRoleDocumentation) {
+        $script:KnownRoleDocumentation = @{
+        "App Opener"                              = @{ Description = "Minimum privileges for common model-driven app tasks; used as a template for custom app roles."; Link = "https://learn.microsoft.com/en-us/power-platform/admin/database-security" }
+        "Basic User"                              = @{ Description = "Runs apps and performs common tasks on owned records for out-of-box tables."; Link = "https://learn.microsoft.com/en-us/power-platform/admin/database-security" }
+        "Environment Maker"                       = @{ Description = "Creates environment resources such as apps, connections, custom APIs, and cloud flows, without data privileges."; Link = "https://learn.microsoft.com/en-us/power-platform/admin/database-security" }
+        "System Administrator"                    = @{ Description = "Full administrative access to install, configure, customize, manage security, and access application data."; Link = "https://learn.microsoft.com/en-us/dynamics365/sales/security-roles-for-sales" }
+        "System Customizer"                       = @{ Description = "Customizes the environment and has broad customization privileges with limited system-table scope."; Link = "https://learn.microsoft.com/en-us/dynamics365/sales/security-roles-for-sales" }
+        "Salesperson"                             = @{ Description = "Works sales records from lead through invoice, including accounts, contacts, activities, and goals."; Link = "https://learn.microsoft.com/en-us/dynamics365/sales/security-roles-for-sales" }
+        "Sales Manager"                           = @{ Description = "Manages sellers, products, sales targets, forecasts, and goals, plus salesperson capabilities."; Link = "https://learn.microsoft.com/en-us/dynamics365/sales/security-roles-for-sales" }
+        "Sales Professional Manager"              = @{ Description = "Manages Sales Professional sellers, products, price lists, unit groups, accounts, and contacts."; Link = "https://learn.microsoft.com/en-us/dynamics365/sales/security-roles-for-sales" }
+        "Sales Professional Person"               = @{ Description = "Works Sales Professional lead-to-invoice processes and manages accounts, contacts, and goals."; Link = "https://learn.microsoft.com/en-us/dynamics365/sales/security-roles-for-sales" }
+        "Forecast Manager"                        = @{ Description = "Configures, clones, deactivates, adjusts, and deletes sales forecasts."; Link = "https://learn.microsoft.com/en-us/dynamics365/sales/security-roles-for-sales" }
+        "Forecast User"                           = @{ Description = "Views forecast and drill-down forecast data for tracking and analysis."; Link = "https://learn.microsoft.com/en-us/dynamics365/sales/security-roles-for-sales" }
+        "Forecast Appuser"                        = @{ Description = "Application role used by Dynamics 365 Sales forecasting processes."; Link = "https://learn.microsoft.com/en-us/dynamics365/sales/security-roles-for-sales" }
+        "Sequence Manager"                        = @{ Description = "Creates and manages sales accelerator sequences, segments, and assignment rules."; Link = "https://learn.microsoft.com/en-us/dynamics365/sales/security-roles-for-sales" }
+        "Sales team member"                       = @{ Description = "Accesses the Sales Team Member app with limited read and activity capabilities."; Link = "https://learn.microsoft.com/en-us/dynamics365/sales/security-roles-for-sales" }
+        "Sales Enterprise App Access"             = @{ Description = "Grants access to the Sales Hub app for Sales Enterprise and Sales Premium users."; Link = "https://learn.microsoft.com/en-us/dynamics365/sales/security-roles-for-sales" }
+        "Sales Professional App Access"           = @{ Description = "Grants access to the Sales Professional app."; Link = "https://learn.microsoft.com/en-us/dynamics365/sales/security-roles-for-sales" }
+        "Sales, Enterprise app access"            = @{ Description = "Grants access to the Sales Hub app."; Link = "https://learn.microsoft.com/en-us/dynamics365/sales/security-roles-for-sales" }
+        "Vice President of Sales"                 = @{ Description = "Has broader-scope sales management access than Sales Manager across more of the organization."; Link = "https://learn.microsoft.com/en-us/dynamics365/sales/security-roles-for-sales" }
+        "VP of Sales"                             = @{ Description = "Has broader-scope sales management access than Sales Manager across more of the organization."; Link = "https://learn.microsoft.com/en-us/dynamics365/sales/security-roles-for-sales" }
+        "Customer Service Representative"         = @{ Description = "Works customer service cases and uses app-profile capabilities in service workspaces."; Link = "https://learn.microsoft.com/en-us/dynamics365/customer-service/administer/security-roles" }
+        "CSR Manager"                             = @{ Description = "Manages customer service representatives and uses app-profile capabilities in service workspaces."; Link = "https://learn.microsoft.com/en-us/dynamics365/customer-service/administer/security-roles" }
+        "Customer Service Manager"                = @{ Description = "Manages customer service operations and representative workloads."; Link = "https://learn.microsoft.com/en-us/dynamics365/customer-service/administer/security-roles" }
+        "Customer Service App Access"             = @{ Description = "Grants access to Customer Service model-driven app experiences."; Link = "https://learn.microsoft.com/en-us/dynamics365/customer-service/administer/security-roles" }
+        "App Profile User"                        = @{ Description = "Reads app profile configuration, extensions, tab templates, notifications, and session templates."; Link = "https://learn.microsoft.com/en-us/dynamics365/customer-service/administer/security-roles" }
+        "Knowledge Manager"                       = @{ Description = "Manages knowledge base content and knowledge-management capabilities for service teams."; Link = "https://learn.microsoft.com/en-us/dynamics365/customer-service/overview-knowledge-management" }
+        "Knowledge Author"                        = @{ Description = "Authors and maintains knowledge articles for customer service knowledge bases."; Link = "https://learn.microsoft.com/en-us/dynamics365/customer-service/overview-knowledge-management" }
+        "Knowledge Search app user"               = @{ Description = "Uses knowledge search capabilities in Customer Service app experiences."; Link = "https://learn.microsoft.com/en-us/dynamics365/customer-service/administer/set-up-knowledge-management-embedded-knowledge-search" }
+        "Omnichannel Agent"                       = @{ Description = "Uses Omnichannel agent experiences with App Profile User privileges included out of the box."; Link = "https://learn.microsoft.com/en-us/dynamics365/customer-service/administer/security-roles" }
+        "Omnichannel Supervisor"                  = @{ Description = "Uses Omnichannel supervisor experiences with App Profile User privileges included out of the box."; Link = "https://learn.microsoft.com/en-us/dynamics365/customer-service/administer/security-roles" }
+        "Omnichannel Administrator"               = @{ Description = "Administers Omnichannel experiences with App Profile Manager Administrator privileges included out of the box."; Link = "https://learn.microsoft.com/en-us/dynamics365/customer-service/administer/security-roles" }
+        "Field Service - Administrator"           = @{ Description = "Administers Field Service tables and configuration, including full IoT table access when paired with IoT roles."; Link = "https://learn.microsoft.com/en-us/dynamics365/field-service/security-permissions" }
+        "Field Service - Dispatcher"              = @{ Description = "Schedules jobs and assigns work orders to frontline workers."; Link = "https://learn.microsoft.com/en-us/dynamics365/field-service/security-permissions" }
+        "Field Service - Resource"                = @{ Description = "Frontline worker or technician role for assigned Field Service work."; Link = "https://learn.microsoft.com/en-us/dynamics365/field-service/security-permissions" }
+        "Field Service - Inventory Purchase"      = @{ Description = "Handles Field Service inventory and purchasing-related activities."; Link = "https://learn.microsoft.com/en-us/dynamics365/field-service/security-permissions" }
+        "Field Service App Access"                = @{ Description = "Grants access to Field Service app experiences."; Link = "https://learn.microsoft.com/en-us/dynamics365/field-service/security-permissions" }
+        "Field Service - App Access"              = @{ Description = "Grants access to Field Service app experiences."; Link = "https://learn.microsoft.com/en-us/dynamics365/field-service/security-permissions" }
+        "IoT - Administrator"                     = @{ Description = "Registers IoT devices and manages Field Service IoT alert processes."; Link = "https://learn.microsoft.com/en-us/dynamics365/field-service/security-permissions" }
+        "IoT - Endpoint User"                     = @{ Description = "Internal role Microsoft uses to connect Dynamics 365 to IoT systems."; Link = "https://learn.microsoft.com/en-us/dynamics365/field-service/security-permissions" }
+        "CFS - IoT Alert Process Flow"            = @{ Description = "Connected Field Service role related to IoT alert process flows."; Link = "https://learn.microsoft.com/en-us/dynamics365/field-service/cfs-security-roles" }
+        "Project Manager"                         = @{ Description = "Creates project plans and requests resources."; Link = "https://learn.microsoft.com/en-us/dynamics365/project-operations/environment/security-model" }
+        "Project Resource"                        = @{ Description = "Booked team member who reports time on projects."; Link = "https://learn.microsoft.com/en-us/dynamics365/project-operations/environment/security-model" }
+        "Project Team Member"                     = @{ Description = "Project team participant who collaborates on project delivery activities."; Link = "https://learn.microsoft.com/en-us/dynamics365/project-operations/environment/security-model" }
+        "Project Approver"                        = @{ Description = "Approves project time, expense, and material entries with required Dataverse permissions."; Link = "https://learn.microsoft.com/en-us/dynamics365/project-operations/approvals/approvals-security" }
+        "Project Approver Admin"                  = @{ Description = "Bypasses approval policies to approve entries regardless of project linkage or submitter relationship."; Link = "https://learn.microsoft.com/en-us/dynamics365/project-operations/approvals/approvals-security" }
+        "Practice Manager"                        = @{ Description = "Supports cross-project reporting."; Link = "https://learn.microsoft.com/en-us/dynamics365/project-operations/environment/security-model" }
+        "Project billing administrator"           = @{ Description = "Creates project invoice proposals."; Link = "https://learn.microsoft.com/en-us/dynamics365/project-operations/environment/security-model" }
+        "Resource Manager"                        = @{ Description = "Manages resource requests and bookings in a centralized resource management role."; Link = "https://learn.microsoft.com/en-us/dynamics365/project-operations/environment/security-model" }
+        "Project Operations App Access"           = @{ Description = "Grants access to Project Operations app experiences."; Link = "https://learn.microsoft.com/en-us/dynamics365/project-operations/environment/security-model" }
+        "Project Operations - App Access"         = @{ Description = "Grants access to Project Operations app experiences."; Link = "https://learn.microsoft.com/en-us/dynamics365/project-operations/environment/security-model" }
+        "Marketing Professional - Business"       = @{ Description = "Works with Customer Insights - Journeys marketing features and core marketing records."; Link = "https://learn.microsoft.com/en-us/dynamics365/marketing/admin-users-licenses-roles" }
+        "Marketing Manager - Business"            = @{ Description = "Manages Customer Insights - Journeys settings and has broader marketing access than professional users."; Link = "https://learn.microsoft.com/en-us/dynamics365/marketing/admin-users-licenses-roles" }
+        "Marketing, Business App Access"          = @{ Description = "Internal solution role for tasks such as syncing data; do not delete or modify."; Link = "https://learn.microsoft.com/en-us/dynamics365/marketing/admin-users-licenses-roles" }
+        "Dynamics 365 Marketing Application User" = @{ Description = "Application/service role used by Customer Insights - Journeys internal processing."; Link = "https://learn.microsoft.com/en-us/dynamics365/marketing/admin-users-licenses-roles" }
+        "EventManagement S2S Inbound"             = @{ Description = "Internal event-management service role used by Customer Insights - Journeys for syncing and processing."; Link = "https://learn.microsoft.com/en-us/dynamics365/marketing/admin-users-licenses-roles" }
+        "Marketing Services User"                 = @{ Description = "Internal solution role used by Customer Insights - Journeys services; do not delete or modify."; Link = "https://learn.microsoft.com/en-us/dynamics365/marketing/admin-users-licenses-roles" }
+        "Marketing Services Application User"     = @{ Description = "Application/service role used by Customer Insights - Journeys internal services."; Link = "https://learn.microsoft.com/en-us/dynamics365/marketing/admin-users-licenses-roles" }
+        "Lead Score Modeler"                      = @{ Description = "Builds lead-scoring models and customizes the lead-to-opportunity marketing process."; Link = "https://learn.microsoft.com/en-us/dynamics365/marketing/admin-users-licenses-roles" }
+        "Lead Score Viewer"                       = @{ Description = "Views calculated lead scores alongside other marketing or sales access."; Link = "https://learn.microsoft.com/en-us/dynamics365/marketing/admin-users-licenses-roles" }
+        "Event Administrator"                     = @{ Description = "Plans events and administers event-management features and settings."; Link = "https://learn.microsoft.com/en-us/dynamics365/marketing/admin-users-licenses-roles" }
+        "Event Planner"                           = @{ Description = "Plans events and works with event records with limited ownership-scoped actions."; Link = "https://learn.microsoft.com/en-us/dynamics365/marketing/admin-users-licenses-roles" }
+    }
+
+    }
+
+    if ($script:KnownRoleDocumentation.ContainsKey($RoleName)) {
+        $documentation = $script:KnownRoleDocumentation[$RoleName].Clone()
+        if (-not $documentation.ContainsKey("AccessGranted")) {
+            $documentation["AccessGranted"] = $documentation.Description
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($ExistingRoleDescription)) {
+            $documentation["Description"] = $ExistingRoleDescription
+        }
+
+        $documentation["SourceUrl"] = $documentation["Link"]
+        return $documentation
+    }
+
+    if ($IsKnownPredefinedRole) {
+        return @{
+            Description = if (-not [string]::IsNullOrWhiteSpace($ExistingRoleDescription)) { $ExistingRoleDescription } else { "Microsoft predefined Dataverse role. See Microsoft Dataverse predefined role documentation for details." }
+            AccessGranted = "See Microsoft Learn source for predefined Dataverse role access details."
+            SourceUrl = "https://learn.microsoft.com/en-us/power-platform/admin/database-security"
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ProductName)) {
+        $description = switch ($ProductRolePurpose) {
+            "App Access" { "Grants access to the $ProductName app experience." }
+            "Internal" { "Internal Microsoft-managed role used by $ProductName solution services." }
+            "Administrative" { "Administrative role for $ProductName configuration or management." }
+            default { "Known or inferred $ProductName role." }
+        }
+
+        $sourceUrl = switch -Regex ($ProductName) {
+            "Sales" { "https://learn.microsoft.com/en-us/dynamics365/sales/security-roles-for-sales"; break }
+            "Field Service" { "https://learn.microsoft.com/en-us/dynamics365/field-service/security-permissions"; break }
+            "Customer Service" { "https://learn.microsoft.com/en-us/dynamics365/customer-service/administer/security-roles"; break }
+            "Project Operations" { "https://learn.microsoft.com/en-us/dynamics365/project-operations/environment/security-model"; break }
+            "Customer Insights" { "https://learn.microsoft.com/en-us/dynamics365/marketing/admin-users-licenses-roles"; break }
+            default { $null }
+        }
+
+        return @{
+            Description = if (-not [string]::IsNullOrWhiteSpace($ExistingRoleDescription)) { $ExistingRoleDescription } else { $description }
+            AccessGranted = $null
+            SourceUrl = $sourceUrl
+        }
+    }
+
+    return @{
+        Description = if (-not [string]::IsNullOrWhiteSpace($ExistingRoleDescription)) { $ExistingRoleDescription } else { $null }
+        AccessGranted = $null
+        SourceUrl = $null
+    }
+}
+
+function Get-RoleOrigin {
+    param(
+        [bool]$IsKnownPredefinedRole,
+        [bool]$IsKnownD365ProductRole,
+        [string]$ProductName,
+        [bool]$HasRoleTemplate,
+        [bool]$IsManaged,
+        [bool]$IsMicrosoftPublisher,
+        [string]$PublisherName
+    )
+
+    if ($IsKnownD365ProductRole -and ($IsManaged -or $IsMicrosoftPublisher)) {
+        return @{
+            Category = "Microsoft Managed"
+            Evidence = "Role matches a predefined Dynamics 365 product role or Microsoft product solution. Product: $ProductName."
+        }
+    }
+
+    if ($IsKnownPredefinedRole) {
+        return @{
+            Category = "Microsoft Managed"
+            Evidence = "Role name matches the Microsoft predefined Dataverse security role list."
+        }
+    }
+
+    if ($HasRoleTemplate -and $IsMicrosoftPublisher) {
+        return @{
+            Category = "Microsoft Managed"
+            Evidence = "Has roletemplateid and belongs to a Microsoft-published solution."
+        }
+    }
+
+    if ($HasRoleTemplate -and -not $PublisherName) {
+        return @{
+            Category = "Likely Microsoft Managed"
+            Evidence = "Has roletemplateid, but the solution publisher could not be resolved."
+        }
+    }
+
+    if ($HasRoleTemplate) {
+        return @{
+            Category = "Custom or copied from Microsoft template"
+            Evidence = "Has roletemplateid, but publisher is not Microsoft."
+        }
+    }
+
+    if ($IsManaged -and $IsMicrosoftPublisher) {
+        return @{
+            Category = "Microsoft Managed"
+            Evidence = "Managed role in a Microsoft-published solution, but no roletemplateid."
+        }
+    }
+
+    if ($IsManaged) {
+        return @{
+            Category = "Managed non-Microsoft"
+            Evidence = "Managed role from a non-Microsoft publisher."
+        }
+    }
+
+    return @{
+        Category = "Custom"
+        Evidence = "No roletemplateid and role is unmanaged."
+    }
+}
+
+function Get-PrivilegeDepthRank {
+    param([int]$PrivilegeDepthMask)
+
+    if (($PrivilegeDepthMask -band 8) -eq 8) {
+        return 4
+    }
+    if (($PrivilegeDepthMask -band 4) -eq 4) {
+        return 3
+    }
+    if (($PrivilegeDepthMask -band 2) -eq 2) {
+        return 2
+    }
+    if (($PrivilegeDepthMask -band 1) -eq 1) {
+        return 1
+    }
+
+    return 0
+}
+
+function Get-PrivilegeDepthLabel {
+    param([int]$PrivilegeDepthMask)
+
+    switch (Get-PrivilegeDepthRank -PrivilegeDepthMask $PrivilegeDepthMask) {
+        4 { return "Global" }
+        3 { return "Deep" }
+        2 { return "Local" }
+        1 { return "Basic" }
+        default { return "None" }
+    }
+}
+
+function Get-RolePrivilegeProperty {
+    param(
+        [object]$RolePrivilege,
+        [string]$Name
+    )
+
+    $value = Get-PropertyValue -Object $RolePrivilege -Name $Name
+    if ($value) {
+        return $value
+    }
+
+    return Get-PropertyValue -Object $RolePrivilege -Name "_$($Name)_value"
+}
+
+function Get-HighRiskPrivilegeCategory {
+    param(
+        [string]$PrivilegeName,
+        [int]$DepthRank
+    )
+
+    if ([string]::IsNullOrWhiteSpace($PrivilegeName)) {
+        return $null
+    }
+
+    # Validate depth per-pattern: some categories only count at higher privilege depth
+    $sensitivePrivilegePatterns = @(
+        @{ Pattern = '^prv(Create|Write|Delete|Assign|Append|AppendTo).*Organization$'; Category = "Organization administration"; MinDepthRank = 0 },
+        @{ Pattern = '^prv(Create|Write|Delete|Append|AppendTo).*Publisher$'; Category = "Publisher administration"; MinDepthRank = 0 },
+        @{ Pattern = '^prv(Create|Write|Delete|Append|AppendTo).*Solution$|^prvImportSolution$|^prvExportSolution$'; Category = "Solution administration"; MinDepthRank = 0 },
+        @{ Pattern = '^prvPublishCustomization$|^prv(Create|Write|Delete).*Customization$'; Category = "Customization publishing"; MinDepthRank = 0 },
+        @{ Pattern = '^prv(Create|Write|Delete).*Entity$|^prv(Create|Write|Delete).*Attribute$|^prv(Create|Write|Delete).*Relationship$'; Category = "Metadata customization"; MinDepthRank = 0 },
+        @{ Pattern = '^prv(Create|Write|Delete|Append|AppendTo).*Plugin|^prv(Create|Write|Delete|Append|AppendTo).*SdkMessageProcessingStep'; Category = "Plugin/extension administration"; MinDepthRank = 0 },
+        @{ Pattern = '^prv(Create|Write|Delete|Assign|Append|AppendTo).*Role$|^prvAssignRole$|^prvAssignUserRoles$'; Category = "Security role administration"; MinDepthRank = 0 },
+        @{ Pattern = '^prv(Create|Write|Delete|Assign|Append|AppendTo).*Privilege$|^prvReadPrivilege$'; Category = "Privilege administration"; MinDepthRank = 4 },
+        @{ Pattern = '^prv(Create|Write|Delete|Assign|Append|AppendTo).*SystemUser$|^prv(Create|Write|Delete|Assign).*User$'; Category = "User administration"; MinDepthRank = 0 },
+        @{ Pattern = '^prv(Create|Write|Delete|Assign|Append|AppendTo).*Team$'; Category = "Team administration"; MinDepthRank = 3 },
+        @{ Pattern = '^prv(Create|Write|Delete|Assign|Append|AppendTo).*BusinessUnit$'; Category = "Business unit administration"; MinDepthRank = 0 },
+        @{ Pattern = '^prv(Create|Write|Delete|Append|AppendTo).*EnvironmentVariable|^prv(Create|Write|Delete|Append|AppendTo).*ConnectionReference'; Category = "Application configuration administration"; MinDepthRank = 2 },
+        @{ Pattern = '^prv(Create|Write|Delete|Activate|Append|AppendTo).*Workflow$|^prv(Create|Write|Delete|Activate).*Process'; Category = "Process/workflow administration"; MinDepthRank = 3 }
+    )
+
+    foreach ($pattern in $sensitivePrivilegePatterns) {
+        if ($PrivilegeName -match $pattern.Pattern) {
+            $min = if ($pattern.ContainsKey('MinDepthRank')) { $pattern.MinDepthRank } else { 1 }
+            if ($DepthRank -ge $min) {
+                return $pattern.Category
+            }
+            else {
+                return $null
+            }
+        }
+    }
+
+    return $null
+}
+
+function Get-PrivilegeSimilarityPercent {
+    param(
+        [hashtable]$RolePrivilegeMap,
+        [hashtable]$BaselinePrivilegeMap
+    )
+
+    if (-not $BaselinePrivilegeMap -or $BaselinePrivilegeMap.Count -eq 0) {
+        return $null
+    }
+
+    $matchCount = 0
+    foreach ($baselinePrivilege in $BaselinePrivilegeMap.GetEnumerator()) {
+        if ($RolePrivilegeMap.ContainsKey($baselinePrivilege.Key) -and $RolePrivilegeMap[$baselinePrivilege.Key].DepthRank -ge $baselinePrivilege.Value.DepthRank) {
+            $matchCount++
+        }
+    }
+
+    return [math]::Round(($matchCount / $BaselinePrivilegeMap.Count) * 100, 1)
+}
+
+function Get-AdminRiskProfile {
+    param(
+        [hashtable]$RolePrivilegeMap,
+        [hashtable]$SystemAdminPrivilegeMap,
+        [hashtable]$SystemCustomizerPrivilegeMap
+    )
+
+    if (-not $RolePrivilegeMap) {
+        $RolePrivilegeMap = @{}
+    }
+
+    $systemAdminSimilarity = Get-PrivilegeSimilarityPercent -RolePrivilegeMap $RolePrivilegeMap -BaselinePrivilegeMap $SystemAdminPrivilegeMap
+    $systemCustomizerSimilarity = Get-PrivilegeSimilarityPercent -RolePrivilegeMap $RolePrivilegeMap -BaselinePrivilegeMap $SystemCustomizerPrivilegeMap
+
+    $highRiskPrivileges = @($RolePrivilegeMap.Values | Where-Object { $_.IsHighRisk })
+    $globalHighRiskPrivileges = @($highRiskPrivileges | Where-Object { $_.DepthRank -ge 4 })
+    $criticalGlobalPrivileges = @($globalHighRiskPrivileges | Where-Object {
+            $_.HighRiskCategory -in @(
+                "Security role administration",
+                "Privilege administration",
+                "User administration",
+                "Business unit administration",
+                "Organization administration",
+                "Plugin/extension administration"
+            )
+        })
+
+    $riskLevel = "Normal"
+    $evidence = New-Object System.Collections.Generic.List[string]
+
+    if ($null -ne $systemAdminSimilarity -and $systemAdminSimilarity -ge 80) {
+        $riskLevel = "Critical"
+        $evidence.Add(">=80% privilege-depth match to System Administrator")
+    }
+    elseif ($criticalGlobalPrivileges.Count -gt 0) {
+        $riskLevel = "Critical"
+        $evidence.Add("Has global critical admin privileges")
+    }
+    elseif (($null -ne $systemAdminSimilarity -and $systemAdminSimilarity -ge 60) -or ($null -ne $systemCustomizerSimilarity -and $systemCustomizerSimilarity -ge 70) -or $globalHighRiskPrivileges.Count -ge 5) {
+        $riskLevel = "High"
+        $evidence.Add("High admin/customizer similarity or multiple global high-risk privileges")
+    }
+    elseif ($globalHighRiskPrivileges.Count -gt 0 -or $highRiskPrivileges.Count -ge 5 -or ($null -ne $systemCustomizerSimilarity -and $systemCustomizerSimilarity -ge 50)) {
+        $riskLevel = "Medium"
+        $evidence.Add("Contains global high-risk privileges, multiple high-risk privileges, or customizer-like access")
+    }
+    elseif ($highRiskPrivileges.Count -gt 0) {
+        $riskLevel = "Low"
+        $evidence.Add("Contains limited high-risk privileges")
+    }
+
+    if ($globalHighRiskPrivileges.Count -gt 0) {
+        $evidence.Add("$($globalHighRiskPrivileges.Count) high-risk privileges at Global depth")
+    }
+
+    $highRiskNames = @($highRiskPrivileges |
+        Sort-Object HighRiskCategory, Name |
+        Select-Object -First 50 |
+        ForEach-Object { "$($_.Name)[$($_.DepthLabel)]" })
+
+    if ($highRiskPrivileges.Count -gt 50) {
+        $highRiskNames += "...+$($highRiskPrivileges.Count - 50) more"
+    }
+
+    [pscustomobject]@{
+        AdminRiskLevel                    = $riskLevel
+        SystemAdminSimilarityPercent      = $systemAdminSimilarity
+        SystemCustomizerSimilarityPercent = $systemCustomizerSimilarity
+        HighRiskPrivilegeCount            = $highRiskPrivileges.Count
+        GlobalHighRiskPrivilegeCount      = $globalHighRiskPrivileges.Count
+        CriticalGlobalPrivilegeCount      = $criticalGlobalPrivileges.Count
+        HighRiskPrivilegeNames            = ($highRiskNames -join "; ")
+        AdminRiskEvidence                 = ($evidence -join "; ")
+    }
+}
+
+$baseUrl = Normalize-EnvironmentUrl -Url $EnvironmentUrl
+$token = Get-DataverseAccessToken -ResourceUrl $baseUrl
+
+$headers = @{
+    Authorization      = "Bearer $token"
+    Accept             = "application/json"
+    "OData-MaxVersion" = "4.0"
+    "OData-Version"    = "4.0"
+    Prefer             = 'odata.include-annotations="OData.Community.Display.V1.FormattedValue"'
+}
+
+$apiRoot = "$baseUrl/api/data/v9.2"
+
+Write-Host "Reading role templates..."
+$roleTemplateUrl = "$apiRoot/roletemplates?`$select=roletemplateid,name"
+$roleTemplates = Invoke-DataversePagedGet -Url $roleTemplateUrl -Headers $headers
+$roleTemplateById = @{}
+foreach ($template in $roleTemplates) {
+    $roleTemplateById[[string]$template.roletemplateid] = $template.name
+}
+
+Write-Host "Reading solutions and publishers..."
+$solutionUrl = "$apiRoot/solutions?`$select=solutionid,uniquename,friendlyname,ismanaged&`$expand=publisherid(`$select=publisherid,uniquename,friendlyname,customizationprefix)"
+$solutions = Invoke-DataversePagedGet -Url $solutionUrl -Headers $headers
+$solutionById = @{}
+foreach ($solution in $solutions) {
+    $solutionById[[string]$solution.solutionid] = $solution
+}
+
+Write-Host "Reading security roles..."
+$roleSelect = "roleid,roleidunique,name,description,ismanaged,solutionid,createdon,modifiedon,_createdby_value,_modifiedby_value,_roletemplateid_value,_parentrootroleid_value,_businessunitid_value"
+$roleUrl = "$apiRoot/roles?`$select=$roleSelect&`$orderby=name asc"
+$roles = Invoke-DataversePagedGet -Url $roleUrl -Headers $headers
+
+if (-not $IncludeBusinessUnitCopies) {
+    $rootOrFirstRoleByKey = @{}
+    foreach ($role in $roles) {
+        $parentRootRoleId = [string](Get-PropertyValue -Object $role -Name "_parentrootroleid_value")
+        $roleId = [string](Get-PropertyValue -Object $role -Name "roleid")
+        $key = if ($parentRootRoleId) { $parentRootRoleId } else { $roleId }
+
+        if (-not $rootOrFirstRoleByKey.ContainsKey($key)) {
+            $rootOrFirstRoleByKey[$key] = $role
+        }
+        elseif ($roleId -eq $key) {
+            $rootOrFirstRoleByKey[$key] = $role
+        }
+    }
+
+    $roles = $rootOrFirstRoleByKey.Values
+}
+
+Write-Host "Reading privileges..."
+$privilegeUrl = "$apiRoot/privileges?`$select=privilegeid,name"
+$privileges = Invoke-DataversePagedGet -Url $privilegeUrl -Headers $headers
+$privilegeNameById = @{}
+foreach ($privilege in $privileges) {
+    $privilegeId = [string](Get-PropertyValue -Object $privilege -Name "privilegeid")
+    if (-not [string]::IsNullOrWhiteSpace($privilegeId)) {
+        $privilegeNameById[$privilegeId.ToLowerInvariant()] = Get-PropertyValue -Object $privilege -Name "name"
+    }
+}
+
+Write-Host "Reading role privileges..."
+$rolePrivilegeUrl = "$apiRoot/roleprivilegescollection?`$select=roleid,privilegeid,privilegedepthmask"
+$rolePrivileges = Invoke-DataversePagedGet -Url $rolePrivilegeUrl -Headers $headers
+
+$selectedRoleIds = @{}
+foreach ($role in $roles) {
+    $roleId = [string](Get-PropertyValue -Object $role -Name "roleid")
+    if (-not [string]::IsNullOrWhiteSpace($roleId)) {
+        $selectedRoleIds[$roleId.ToLowerInvariant()] = $true
+    }
+}
+
+$rolePrivilegeMapByRoleId = @{}
+foreach ($rolePrivilege in $rolePrivileges) {
+    $rolePrivilegeRoleId = [string](Get-RolePrivilegeProperty -RolePrivilege $rolePrivilege -Name "roleid")
+    $rolePrivilegePrivilegeId = [string](Get-RolePrivilegeProperty -RolePrivilege $rolePrivilege -Name "privilegeid")
+
+    if ([string]::IsNullOrWhiteSpace($rolePrivilegeRoleId) -or [string]::IsNullOrWhiteSpace($rolePrivilegePrivilegeId)) {
+        continue
+    }
+
+    $rolePrivilegeRoleId = $rolePrivilegeRoleId.ToLowerInvariant()
+    $rolePrivilegePrivilegeId = $rolePrivilegePrivilegeId.ToLowerInvariant()
+
+    if (-not $selectedRoleIds.ContainsKey($rolePrivilegeRoleId)) {
+        continue
+    }
+
+    if (-not $privilegeNameById.ContainsKey($rolePrivilegePrivilegeId)) {
+        continue
+    }
+
+    $privilegeName = [string]$privilegeNameById[$rolePrivilegePrivilegeId]
+    if ([string]::IsNullOrWhiteSpace($privilegeName)) {
+        continue
+    }
+
+    $depthMask = [int](Get-PropertyValue -Object $rolePrivilege -Name "privilegedepthmask")
+    $depthRank = Get-PrivilegeDepthRank -PrivilegeDepthMask $depthMask
+    $highRiskCategory = Get-HighRiskPrivilegeCategory -PrivilegeName $privilegeName -DepthRank $depthRank
+    $privilegeSummary = [pscustomobject]@{
+        Name             = $privilegeName
+        DepthMask        = $depthMask
+        DepthRank        = $depthRank
+        DepthLabel       = Get-PrivilegeDepthLabel -PrivilegeDepthMask $depthMask
+        IsHighRisk       = -not [string]::IsNullOrWhiteSpace($highRiskCategory)
+        HighRiskCategory = $highRiskCategory
+    }
+
+    if (-not $rolePrivilegeMapByRoleId.ContainsKey($rolePrivilegeRoleId)) {
+        $rolePrivilegeMapByRoleId[$rolePrivilegeRoleId] = @{}
+    }
+
+    $rolePrivilegeMap = $rolePrivilegeMapByRoleId[$rolePrivilegeRoleId]
+    if (-not $rolePrivilegeMap.ContainsKey($privilegeName) -or $depthRank -gt $rolePrivilegeMap[$privilegeName].DepthRank) {
+        $rolePrivilegeMap[$privilegeName] = $privilegeSummary
+    }
+}
+
+$systemAdminRole = @($roles | Where-Object { (Get-PropertyValue -Object $_ -Name "name") -eq "System Administrator" } | Select-Object -First 1)
+$systemCustomizerRole = @($roles | Where-Object { (Get-PropertyValue -Object $_ -Name "name") -eq "System Customizer" } | Select-Object -First 1)
+$systemAdminPrivilegeMap = @{}
+$systemCustomizerPrivilegeMap = @{}
+
+if ($systemAdminRole.Count -gt 0) {
+    $systemAdminRoleId = ([string](Get-PropertyValue -Object $systemAdminRole[0] -Name "roleid")).ToLowerInvariant()
+    if ($rolePrivilegeMapByRoleId.ContainsKey($systemAdminRoleId)) {
+        $systemAdminPrivilegeMap = $rolePrivilegeMapByRoleId[$systemAdminRoleId]
+    }
+}
+else {
+    Write-Warning "System Administrator role was not found. SystemAdminSimilarityPercent will be blank."
+}
+
+if ($systemCustomizerRole.Count -gt 0) {
+    $systemCustomizerRoleId = ([string](Get-PropertyValue -Object $systemCustomizerRole[0] -Name "roleid")).ToLowerInvariant()
+    if ($rolePrivilegeMapByRoleId.ContainsKey($systemCustomizerRoleId)) {
+        $systemCustomizerPrivilegeMap = $rolePrivilegeMapByRoleId[$systemCustomizerRoleId]
+    }
+}
+else {
+    Write-Warning "System Customizer role was not found. SystemCustomizerSimilarityPercent will be blank."
+}
+
+$results = foreach ($role in $roles) {
+    $roleName = Get-PropertyValue -Object $role -Name "name"
+    $roleTemplateId = [string](Get-PropertyValue -Object $role -Name "_roletemplateid_value")
+    $existingRoleDescription = [string](Get-PropertyValue -Object $role -Name "description")
+    $solutionId = [string](Get-PropertyValue -Object $role -Name "solutionid")
+    $solution = if ($solutionById.ContainsKey($solutionId)) { $solutionById[$solutionId] } else { $null }
+    $publisher = if ($solution) { Get-PropertyValue -Object $solution -Name "publisherid" } else { $null }
+
+    $publisherName = [string](Get-PropertyValue -Object $publisher -Name "friendlyname")
+    $publisherUniqueName = [string](Get-PropertyValue -Object $publisher -Name "uniquename")
+    $publisherPrefix = [string](Get-PropertyValue -Object $publisher -Name "customizationprefix")
+    $isMicrosoftPublisher = Test-MicrosoftPublisher -PublisherName $publisherName -PublisherUniqueName $publisherUniqueName -CustomizationPrefix $publisherPrefix
+    $solutionName = if ($solution) { Get-PropertyValue -Object $solution -Name "friendlyname" } else { $null }
+    $solutionUniqueName = if ($solution) { Get-PropertyValue -Object $solution -Name "uniquename" } else { $null }
+    $hasRoleTemplate = -not [string]::IsNullOrWhiteSpace($roleTemplateId)
+    $isManaged = [bool](Get-PropertyValue -Object $role -Name "ismanaged")
+    $isKnownPredefinedRole = Test-KnownPredefinedRole -RoleName $roleName
+    $productName = Get-MicrosoftProductName -RoleName $roleName -IsKnownPredefinedRole $isKnownPredefinedRole -SolutionName $solutionName -SolutionUniqueName $solutionUniqueName -PublisherPrefix $publisherPrefix
+    $productRolePurpose = Get-ProductRolePurpose -RoleName $roleName -ProductName $productName -IsKnownPredefinedRole $isKnownPredefinedRole
+    $roleDocumentation = Get-KnownRoleDocumentation -RoleName $roleName -ProductName $productName -ProductRolePurpose $productRolePurpose -IsKnownPredefinedRole $isKnownPredefinedRole -ExistingRoleDescription $existingRoleDescription
+    $isKnownD365ProductRole = -not [string]::IsNullOrWhiteSpace($productName)
+    $origin = Get-RoleOrigin -IsKnownPredefinedRole $isKnownPredefinedRole -IsKnownD365ProductRole $isKnownD365ProductRole -ProductName $productName -HasRoleTemplate $hasRoleTemplate -IsManaged $isManaged -IsMicrosoftPublisher $isMicrosoftPublisher -PublisherName $publisherName
+
+    # compute privilege map for this role and evaluate admin risk
+    $roleId = [string](Get-PropertyValue -Object $role -Name "roleid")
+    $roleIdLower = if ($roleId) { $roleId.ToLowerInvariant() } else { $null }
+    $rolePrivilegeMap = if ($roleIdLower -and $rolePrivilegeMapByRoleId.ContainsKey($roleIdLower)) { $rolePrivilegeMapByRoleId[$roleIdLower] } else { @{} }
+    $adminRisk = Get-AdminRiskProfile -RolePrivilegeMap $rolePrivilegeMap -SystemAdminPrivilegeMap $systemAdminPrivilegeMap -SystemCustomizerPrivilegeMap $systemCustomizerPrivilegeMap
+
+    [pscustomobject]@{
+        RoleName              = $roleName
+        Category              = $origin.Category
+        Evidence              = $origin.Evidence
+        IsKnownPredefinedRole = $isKnownPredefinedRole
+        IsKnownD365ProductRole = $isKnownD365ProductRole
+        ProductName           = $productName
+        ProductRolePurpose    = $productRolePurpose
+        RoleDescription       = $roleDocumentation.Description
+        AccessGranted         = $roleDocumentation.AccessGranted
+        SourceUrl             = $roleDocumentation.SourceUrl
+        AdminRiskLevel                    = if ($adminRisk) { $adminRisk.AdminRiskLevel } else { $null }
+        SystemAdminSimilarityPercent      = if ($adminRisk) { $adminRisk.SystemAdminSimilarityPercent } else { $null }
+        SystemCustomizerSimilarityPercent = if ($adminRisk) { $adminRisk.SystemCustomizerSimilarityPercent } else { $null }
+        HighRiskPrivilegeCount            = if ($adminRisk) { $adminRisk.HighRiskPrivilegeCount } else { 0 }
+        GlobalHighRiskPrivilegeCount      = if ($adminRisk) { $adminRisk.GlobalHighRiskPrivilegeCount } else { 0 }
+        CriticalGlobalPrivilegeCount      = if ($adminRisk) { $adminRisk.CriticalGlobalPrivilegeCount } else { 0 }
+        HighRiskPrivilegeNames            = if ($adminRisk) { $adminRisk.HighRiskPrivilegeNames } else { $null }
+        AdminRiskEvidence                 = if ($adminRisk) { $adminRisk.AdminRiskEvidence } else { $null }
+        IsManaged             = $isManaged
+        RoleTemplateName      = if ($roleTemplateById.ContainsKey($roleTemplateId)) { $roleTemplateById[$roleTemplateId] } else { $null }
+        RoleTemplateId        = $roleTemplateId
+        SolutionName          = $solutionName
+        SolutionUniqueName    = $solutionUniqueName
+        PublisherName         = $publisherName
+        PublisherUniqueName   = $publisherUniqueName
+        PublisherPrefix       = $publisherPrefix
+        CreatedBy             = Get-FormattedValue -Object $role -LookupName "_createdby_value"
+        CreatedOn             = Get-PropertyValue -Object $role -Name "createdon"
+        ModifiedBy            = Get-FormattedValue -Object $role -LookupName "_modifiedby_value"
+        ModifiedOn            = Get-PropertyValue -Object $role -Name "modifiedon"
+        BusinessUnit          = Get-FormattedValue -Object $role -LookupName "_businessunitid_value"
+        RoleId                = Get-PropertyValue -Object $role -Name "roleid"
+        RoleIdUnique          = Get-PropertyValue -Object $role -Name "roleidunique"
+        ParentRootRoleId      = Get-PropertyValue -Object $role -Name "_parentrootroleid_value"
+    }
+}
+
+$sortedResults = $results | Sort-Object Category, RoleName, BusinessUnit
+$resolvedOutputPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputPath)
+$sortedResults | Export-Csv -Path $resolvedOutputPath -NoTypeInformation -Encoding UTF8
+
+$sortedResults | Format-Table RoleName, Category, ProductName, ProductRolePurpose, RoleDescription, AccessGranted, SourceUrl, IsKnownPredefinedRole, IsKnownD365ProductRole, IsManaged, RoleTemplateName, SolutionUniqueName, PublisherName, PublisherPrefix -AutoSize
+Write-Host ""
+Write-Host "Exported CSV: $resolvedOutputPath"
+
